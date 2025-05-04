@@ -26,6 +26,7 @@ def get_image(codprod: int) -> Path:
     return image_path
 
 
+@app.get("/{codprod}")
 @app.get("/{codprod}.jpg")
 async def serve_image(codprod: int, background_tasks: BackgroundTasks):
     try:
