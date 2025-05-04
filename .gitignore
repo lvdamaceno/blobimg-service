@@ -192,3 +192,5 @@ config.json
 *.zip
 lotes_erro.json
 lotes_sucesso.json
+
+/images/*
