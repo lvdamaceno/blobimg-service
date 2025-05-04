@@ -1,54 +1,42 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse
-import os
+from fastapi import FastAPI, Response, BackgroundTasks
 from sankhya_api.sk_api_utils import consulta_sankhya
+from pathlib import Path
+import os
 
 app = FastAPI()
+IMAGES_DIR = Path("images")
+IMAGES_DIR.mkdir(exist_ok=True)  # Garante que a pasta existe
 
-IMAGE_DIR = "images"
-os.makedirs(IMAGE_DIR, exist_ok=True)
 
-
-def get_image(codprod: int) -> str:
-    """
-    Consulta a imagem no banco de dados Sankhya e salva na pasta 'images'.
-    Retorna o caminho do arquivo salvo.
-    """
+def get_image(codprod: int) -> Path:
     sankhya_service = "DbExplorerSP.executeQuery"
     query = f"SELECT IMAGEM FROM TGFPRO WHERE CODPROD = {codprod}"
     result = consulta_sankhya(query, sankhya_service)
 
-    if not result:
-        raise ValueError(f"Imagem não encontrada para o produto {codprod}")
+    if not result or not result[0]:
+        raise ValueError("Imagem não encontrada para o produto.")
 
     imagem_hex = result[0]
     imagem_bytes = bytes.fromhex(imagem_hex)
+    image_path = IMAGES_DIR / f"{codprod}.jpg"
 
-    filepath = os.path.join(IMAGE_DIR, f"{codprod}.jpg")
-
-    with open(filepath, "wb") as f:
+    with open(image_path, "wb") as f:
         f.write(imagem_bytes)
 
-    return filepath
-
-
-def remove_file(path: str):
-    """Remove o arquivo salvo após o envio."""
-    try:
-        os.remove(path)
-        print(f"[INFO] Arquivo removido: {path}")
-    except Exception as e:
-        print(f"[ERRO] Falha ao remover {path}: {e}")
+    return image_path
 
 
 @app.get("/{codprod}.jpg")
-def serve_image(codprod: int, background_tasks: BackgroundTasks):
-    """
-    Endpoint que gera a imagem, serve ao cliente e agenda sua remoção após envio.
-    """
+async def serve_image(codprod: int, background_tasks: BackgroundTasks):
     try:
-        filepath = get_image(codprod)
-        background_tasks.add_task(remove_file, filepath)
-        return FileResponse(filepath, media_type="image/jpeg")
+        image_path = get_image(codprod)
     except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return Response(content=str(e), status_code=404)
+
+    def delete_file(path: Path):
+        if path.exists():
+            path.unlink()
+
+    background_tasks.add_task(delete_file, image_path)
+
+    return Response(content=image_path.read_bytes(), media_type="image/jpeg")
