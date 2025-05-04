@@ -1,0 +1,10 @@
+[project]
+name = "sankhya_api"
+version = "0.1.0"
+description = "Cliente para API Sankhya com autenticação e execução de queries"
+authors = [{ name = "Vinicius Damaceno", email = "lvdamaceno@gmail.com" }]
+dependencies = ["requests", "python-dotenv"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
