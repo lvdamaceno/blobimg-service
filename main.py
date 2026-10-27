@@ -16,7 +16,6 @@ IMAGES_DIR = Path("images")
 IMAGES_DIR.mkdir(exist_ok=True)  # Garante que a pasta existe
 
 CACHE_CONTROL = "public, max-age=86400"  # 1 dia no navegador/CDN
-# Sempre image/jpeg: o sistema que consome os links só aceita esse tipo
 SEM_IMAGEM_TTL = 3600  # segundos que um "produto sem imagem" fica em cache
 
 _sem_imagem: dict[int, float] = {}  # codprod -> expira em (timestamp)
@@ -98,4 +97,5 @@ def serve_image(codprod: int, request: Request):
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
 
+    # Sempre image/jpeg: o sistema que consome os links só aceita esse tipo
     return Response(content=conteudo, media_type="image/jpeg", headers=headers)
