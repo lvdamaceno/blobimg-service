@@ -1,42 +1,110 @@
-from fastapi import FastAPI, Response, BackgroundTasks
-from sankhya_api.sk_api_utils import consulta_sankhya
+import hashlib
+import logging
+import os
+import threading
+import time
 from pathlib import Path
+
+from fastapi import FastAPI, Request, Response
+from sankhya_api.sk_api_utils import consulta_sankhya
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("blobimg")
 
 app = FastAPI()
 IMAGES_DIR = Path("images")
 IMAGES_DIR.mkdir(exist_ok=True)  # Garante que a pasta existe
 
+CACHE_CONTROL = "public, max-age=86400"  # 1 dia no navegador/CDN
+SEM_IMAGEM_TTL = 3600  # segundos que um "produto sem imagem" fica em cache
 
-def consultar_e_salvar_imagem(codprod: int) -> Path:
+_sem_imagem: dict[int, float] = {}  # codprod -> expira em (timestamp)
+_locks: dict[int, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+class ImagemNaoEncontrada(Exception):
+    """Produto não existe ou não tem imagem cadastrada."""
+
+
+def _lock_do_produto(codprod: int) -> threading.Lock:
+    with _locks_guard:
+        return _locks.setdefault(codprod, threading.Lock())
+
+
+def _detectar_media_type(conteudo: bytes) -> str:
+    if conteudo.startswith(b"\x89PNG"):
+        return "image/png"
+    if conteudo.startswith(b"GIF8"):
+        return "image/gif"
+    if conteudo[:4] == b"RIFF" and conteudo[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def consultar_e_salvar_imagem(codprod: int) -> bytes:
     sankhya_service = "DbExplorerSP.executeQuery"
     query = f"SELECT IMAGEM FROM TGFPRO WHERE CODPROD = {codprod}"
+
+    inicio = time.monotonic()
     result = consulta_sankhya(query, sankhya_service)
+    logger.info("Consulta Sankhya codprod=%s em %.2fs", codprod, time.monotonic() - inicio)
 
     if not result or not result[0]:
-        raise ValueError("Imagem não encontrada no banco de dados.")
+        raise ImagemNaoEncontrada("Imagem não encontrada no banco de dados.")
 
-    imagem_hex = result[0]
-    imagem_bytes = bytes.fromhex(imagem_hex)
+    imagem_bytes = bytes.fromhex(result[0])
     image_path = IMAGES_DIR / f"{codprod}.jpg"
 
-    with open(image_path, "wb") as f:
-        f.write(imagem_bytes)
+    # Grava em arquivo temporário e renomeia: nunca deixa arquivo pela metade no cache
+    tmp_path = image_path.with_suffix(f".{threading.get_ident()}.tmp")
+    tmp_path.write_bytes(imagem_bytes)
+    os.replace(tmp_path, image_path)
 
-    return image_path
+    return imagem_bytes
+
+
+def _obter_imagem(codprod: int) -> bytes:
+    image_path = IMAGES_DIR / f"{codprod}.jpg"
+    if image_path.exists():
+        return image_path.read_bytes()
+
+    if _sem_imagem.get(codprod, 0) > time.time():
+        raise ImagemNaoEncontrada("Imagem não encontrada no banco de dados.")
+
+    # Requisições simultâneas do mesmo produto fazem uma única consulta ao Sankhya
+    with _lock_do_produto(codprod):
+        if image_path.exists():
+            return image_path.read_bytes()
+        try:
+            return consultar_e_salvar_imagem(codprod)
+        except ImagemNaoEncontrada:
+            _sem_imagem[codprod] = time.time() + SEM_IMAGEM_TTL
+            raise
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.get("/{codprod}")
 @app.get("/{codprod}.jpg")
-async def serve_image(codprod: int):
-    image_path = IMAGES_DIR / f"{codprod}.jpg"
-
-    if image_path.exists():
-        # Servindo imagem do cache
-        return Response(content=image_path.read_bytes(), media_type="image/jpeg")
-
+def serve_image(codprod: int, request: Request):
+    # Função síncrona: o FastAPI executa em threadpool, então uma consulta lenta
+    # ao Sankhya não bloqueia as demais requisições.
     try:
-        # Buscar no banco e salvar
-        image_path = consultar_e_salvar_imagem(codprod)
-        return Response(content=image_path.read_bytes(), media_type="image/jpeg")
-    except Exception as e:
-        return Response(content=str(e), status_code=404)
+        conteudo = _obter_imagem(codprod)
+    except ImagemNaoEncontrada as e:
+        return Response(content=str(e), status_code=404, headers={"Cache-Control": "public, max-age=300"})
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error("Falha ao buscar codprod=%s no Sankhya: %s", codprod, e)
+        return Response(content="Erro ao consultar o Sankhya.", status_code=502)
+
+    etag = f'"{hashlib.md5(conteudo).hexdigest()}"'
+    headers = {"Cache-Control": CACHE_CONTROL, "ETag": etag}
+
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+
+    return Response(content=conteudo, media_type=_detectar_media_type(conteudo), headers=headers)
