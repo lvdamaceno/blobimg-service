@@ -179,8 +179,7 @@ def test_vencida_removida_no_erp_passa_a_404(client, sankhya, tmp_path):
     sankhya.imagens[1] = None
 
     assert client.get("/1").status_code == 200
-    assert _esperar(lambda: not (tmp_path / "1.jpg").exists())
-    assert not (tmp_path / "1_w100.jpg").exists()
+    assert _esperar(lambda: not (tmp_path / "1.jpg").exists() and not (tmp_path / "1_w100.jpg").exists())
     assert client.get("/1").status_code == 404
 
 

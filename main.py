@@ -109,9 +109,10 @@ def _obter_redimensionada(codprod: int, original: bytes, largura: int) -> bytes:
 
 
 def _remover_do_cache(codprod: int):
-    _caminho(codprod).unlink(missing_ok=True)
+    # Redimensionadas primeiro: nunca sobra uma redimensionada sem a original
     for path in IMAGES_DIR.glob(f"{codprod}_w*.jpg"):
         path.unlink(missing_ok=True)
+    _caminho(codprod).unlink(missing_ok=True)
 
 
 def consultar_e_salvar_imagem(codprod: int) -> bytes:
