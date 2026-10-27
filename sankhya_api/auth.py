@@ -10,9 +10,11 @@ from datetime import datetime
 import requests
 from dotenv import load_dotenv
 from sankhya_api.exceptions import AuthError
-from sankhya_api.http_session import session, DEFAULT_TIMEOUT
+from sankhya_api.http_session import session
 
 load_dotenv()
+
+AUTH_TIMEOUT = (5, 30)  # o login no gateway Sankhya pode levar ~15s
 
 
 def log_tempo(msg=""):
@@ -52,7 +54,7 @@ class SankhyaAuth:  # pylint: disable=too-few-public-methods
         # log_tempo("Antes de fazer POST na URL de autenticação")
 
         try:
-            response = session.post(self.url_auth, headers=headers, timeout=DEFAULT_TIMEOUT)
+            response = session.post(self.url_auth, headers=headers, timeout=AUTH_TIMEOUT)
             # log_tempo("Resposta recebida da API Sankhya")
 
             if response.status_code == 200:
