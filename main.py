@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Query, Request, Response
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from sankhya_api.sk_api_utils import consulta_sankhya
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -43,6 +43,7 @@ AQUECIMENTO_MAX_FALHAS = 10  # falhas seguidas antes de desistir e tentar mais t
 _sem_imagem: dict[int, float] = {}  # codprod -> expira em (timestamp)
 _locks: dict[int, threading.Lock] = {}
 _locks_guard = threading.Lock()
+_aquecimento = {"estado": "desligado", "pendentes": 0, "processadas": 0, "baixadas": 0, "falhas": 0, "ultimo_erro": None}
 
 
 class ImagemNaoEncontrada(Exception):
@@ -109,9 +110,10 @@ def _obter_redimensionada(codprod: int, original: bytes, largura: int) -> bytes:
 
 
 def _remover_do_cache(codprod: int):
-    _caminho(codprod).unlink(missing_ok=True)
+    # Redimensionadas primeiro: nunca sobra uma redimensionada sem a original
     for path in IMAGES_DIR.glob(f"{codprod}_w*.jpg"):
         path.unlink(missing_ok=True)
+    _caminho(codprod).unlink(missing_ok=True)
 
 
 def consultar_e_salvar_imagem(codprod: int) -> bytes:
@@ -125,7 +127,12 @@ def consultar_e_salvar_imagem(codprod: int) -> bytes:
     if not result or not result[0]:
         raise ImagemNaoEncontrada("Imagem não encontrada no banco de dados.")
 
-    imagem_bytes = _para_jpeg(bytes.fromhex(result[0]))
+    try:
+        imagem_bytes = _para_jpeg(bytes.fromhex(result[0]))
+    except (ValueError, UnidentifiedImageError) as e:
+        # O Sankhya às vezes guarda texto no lugar da imagem (ex.: "deletado")
+        logger.warning("codprod=%s: conteúdo do campo IMAGEM não é uma imagem (%d bytes)", codprod, len(result[0]) // 2)
+        raise ImagemNaoEncontrada("Imagem não encontrada no banco de dados.") from e
     _gravar(_caminho(codprod), imagem_bytes)
     return imagem_bytes
 
@@ -197,11 +204,14 @@ def _listar_produtos_com_imagem() -> list:
 
 def _aquecer_uma_vez() -> bool:
     """Baixa as imagens que faltam no cache. Retorna False se parou por falhas seguidas."""
+    _aquecimento.update(estado="listando", processadas=0, baixadas=0, falhas=0, ultimo_erro=None)
     faltando = [c for c in _listar_produtos_com_imagem() if not _caminho(int(c)).exists()]
     logger.info("Aquecimento: %d imagens fora do cache", len(faltando))
+    _aquecimento.update(estado="baixando", pendentes=len(faltando))
 
     baixadas = falhas_seguidas = 0
     for codprod in map(int, faltando):
+        _aquecimento["processadas"] += 1
         lock = _lock_do_produto(codprod)
         if not lock.acquire(blocking=False):
             continue  # uma requisição já está buscando este produto
@@ -209,14 +219,18 @@ def _aquecer_uma_vez() -> bool:
             if not _caminho(codprod).exists():
                 consultar_e_salvar_imagem(codprod)
                 baixadas += 1
+                _aquecimento["baixadas"] = baixadas
             falhas_seguidas = 0
         except ImagemNaoEncontrada:
             falhas_seguidas = 0
         except Exception as e:  # pylint: disable=broad-except
             falhas_seguidas += 1
+            _aquecimento["falhas"] += 1
+            _aquecimento["ultimo_erro"] = f"codprod={codprod}: {e}"[:300]
             logger.warning("Aquecimento: falha em codprod=%s: %s", codprod, e)
             if falhas_seguidas >= AQUECIMENTO_MAX_FALHAS:
                 logger.error("Aquecimento interrompido após %d falhas seguidas", falhas_seguidas)
+                _aquecimento["estado"] = "interrompido"
                 return False
         finally:
             lock.release()
@@ -225,6 +239,7 @@ def _aquecer_uma_vez() -> bool:
         time.sleep(AQUECIMENTO_PAUSA)
 
     logger.info("Aquecimento concluído: %d imagens baixadas", baixadas)
+    _aquecimento["estado"] = "concluido"
     return True
 
 
@@ -234,6 +249,7 @@ def _aquecer_cache():
             concluido = _aquecer_uma_vez()
         except Exception as e:  # pylint: disable=broad-except
             logger.error("Falha no aquecimento do cache: %s", e)
+            _aquecimento.update(estado="interrompido", ultimo_erro=str(e)[:300])
             concluido = False
         # Se o Sankhya estava com problema, tenta de novo em 1h em vez de esperar 1 dia
         time.sleep(AQUECIMENTO_INTERVALO if concluido else 3600)
@@ -243,7 +259,7 @@ def _aquecer_cache():
 def health():
     # imagens_em_cache permite conferir se o disco persiste entre deploys
     originais = sum(1 for p in IMAGES_DIR.glob("*.jpg") if p.stem.isdigit())  # ignora as redimensionadas
-    return {"status": "ok", "imagens_em_cache": originais}
+    return {"status": "ok", "imagens_em_cache": originais, "aquecimento": _aquecimento}
 
 
 @app.get("/{codprod}")
