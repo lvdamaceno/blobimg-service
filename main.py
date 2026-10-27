@@ -31,7 +31,7 @@ IMAGEM_TTL = int(os.getenv("IMAGEM_TTL", "86400"))  # validade da imagem em disc
 SEM_IMAGEM_TTL = 3600  # segundos que um "produto sem imagem" fica em cache
 CACHE_CONTROL = "public, max-age=86400"  # 1 dia no navegador/CDN
 JPEG_QUALIDADE = 90
-LARGURA_MIN, LARGURA_MAX = 16, 2000
+LARGURAS = (100, 200, 400, 800)  # tamanhos aceitos no ?w=, guardados em disco
 
 # Aquecimento: baixa em segundo plano as imagens que ainda não estão no cache.
 # Ligado por padrão só no Render (que define RENDER=true), para não baixar tudo em dev.
@@ -88,6 +88,32 @@ def _redimensionar(conteudo: bytes, largura: int) -> bytes:
         return _salvar_jpeg(img.resize((largura, altura), Image.LANCZOS))
 
 
+def _gravar(path: Path, conteudo: bytes):
+    # Grava em arquivo temporário e renomeia: nunca deixa arquivo pela metade no cache
+    tmp_path = path.with_suffix(f".{threading.get_ident()}.tmp")
+    tmp_path.write_bytes(conteudo)
+    os.replace(tmp_path, path)
+
+
+def _obter_redimensionada(codprod: int, original: bytes, largura: int) -> bytes:
+    path = IMAGES_DIR / f"{codprod}_w{largura}.jpg"
+    try:
+        # Só vale se foi gerada depois da última atualização da original
+        if path.stat().st_mtime >= _caminho(codprod).stat().st_mtime:
+            return path.read_bytes()
+    except FileNotFoundError:
+        pass
+    conteudo = _redimensionar(original, largura)
+    _gravar(path, conteudo)
+    return conteudo
+
+
+def _remover_do_cache(codprod: int):
+    _caminho(codprod).unlink(missing_ok=True)
+    for path in IMAGES_DIR.glob(f"{codprod}_w*.jpg"):
+        path.unlink(missing_ok=True)
+
+
 def consultar_e_salvar_imagem(codprod: int) -> bytes:
     sankhya_service = "DbExplorerSP.executeQuery"
     query = f"SELECT IMAGEM FROM TGFPRO WHERE CODPROD = {codprod}"
@@ -100,13 +126,7 @@ def consultar_e_salvar_imagem(codprod: int) -> bytes:
         raise ImagemNaoEncontrada("Imagem não encontrada no banco de dados.")
 
     imagem_bytes = _para_jpeg(bytes.fromhex(result[0]))
-    image_path = _caminho(codprod)
-
-    # Grava em arquivo temporário e renomeia: nunca deixa arquivo pela metade no cache
-    tmp_path = image_path.with_suffix(f".{threading.get_ident()}.tmp")
-    tmp_path.write_bytes(imagem_bytes)
-    os.replace(tmp_path, image_path)
-
+    _gravar(_caminho(codprod), imagem_bytes)
     return imagem_bytes
 
 
@@ -129,7 +149,7 @@ def _atualizar_em_segundo_plano(codprod: int):
     except ImagemNaoEncontrada:
         # A imagem foi removida no ERP
         _sem_imagem[codprod] = time.time() + SEM_IMAGEM_TTL
-        _caminho(codprod).unlink(missing_ok=True)
+        _remover_do_cache(codprod)
     except Exception as e:  # pylint: disable=broad-except
         # Mantém a imagem antiga; tenta de novo na próxima requisição
         logger.warning("Falha ao atualizar codprod=%s: %s", codprod, e)
@@ -222,7 +242,8 @@ def _aquecer_cache():
 @app.get("/health")
 def health():
     # imagens_em_cache permite conferir se o disco persiste entre deploys
-    return {"status": "ok", "imagens_em_cache": sum(1 for _ in IMAGES_DIR.glob("*.jpg"))}
+    originais = sum(1 for p in IMAGES_DIR.glob("*.jpg") if p.stem.isdigit())  # ignora as redimensionadas
+    return {"status": "ok", "imagens_em_cache": originais}
 
 
 @app.get("/{codprod}")
@@ -230,10 +251,13 @@ def health():
 def serve_image(
     codprod: int,
     request: Request,
-    w: Optional[int] = Query(None, ge=LARGURA_MIN, le=LARGURA_MAX, description="Largura máxima em pixels"),
+    w: Optional[int] = Query(None, description=f"Largura máxima em pixels: {', '.join(map(str, LARGURAS))}"),
 ):
     # Função síncrona: o FastAPI executa em threadpool, então uma consulta lenta
     # ao Sankhya não bloqueia as demais requisições.
+    if w is not None and w not in LARGURAS:
+        return Response(content=f"w deve ser um destes valores: {', '.join(map(str, LARGURAS))}", status_code=422)
+
     try:
         conteudo = _obter_imagem(codprod)
     except ImagemNaoEncontrada as e:
@@ -244,7 +268,7 @@ def serve_image(
 
     conteudo = _para_jpeg(conteudo)  # cobre arquivos gravados antes da conversão existir
     if w:
-        conteudo = _redimensionar(conteudo, w)
+        conteudo = _obter_redimensionada(codprod, conteudo, w)
 
     etag = f'"{hashlib.md5(conteudo).hexdigest()}"'
     headers = {"Cache-Control": CACHE_CONTROL, "ETag": etag}

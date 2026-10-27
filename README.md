@@ -9,7 +9,7 @@ Produção: https://blobimg-service.onrender.com (Render, deploy automático a p
 ```
 GET /{codprod}.jpg          # ex.: /406676.jpg
 GET /{codprod}              # mesmo resultado
-GET /{codprod}.jpg?w=400    # redimensionada para no máximo 400px de largura (16–2000)
+GET /{codprod}.jpg?w=400    # no máximo 400px de largura (w: 100, 200, 400 ou 800)
 GET /health                 # health check
 ```
 
@@ -26,8 +26,9 @@ GET /health                 # health check
 3. Depois disso, a imagem em disco continua sendo servida e é atualizada em segundo plano. Se o Sankhya falhar, a imagem antiga continua valendo.
 4. Se a imagem foi removida no ERP, o arquivo é apagado e o produto passa a responder `404`.
 5. Produtos sem imagem ficam 1h em cache de memória, para não consultar o Sankhya a cada acesso.
-6. Requisições simultâneas do mesmo produto fazem uma única consulta.
-7. **Aquecimento:** ao iniciar, e depois uma vez por dia, o serviço baixa em segundo plano as imagens dos produtos ativos que ainda não estão no cache. As consultas são feitas uma de cada vez, com uma pausa entre elas. Depois de 10 falhas seguidas o aquecimento para e tenta de novo em 1h.
+6. As versões redimensionadas (`?w=`) também ficam em disco (`{codprod}_w{w}.jpg`) e são refeitas quando a original é atualizada.
+7. Requisições simultâneas do mesmo produto fazem uma única consulta.
+8. **Aquecimento:** ao iniciar, e depois uma vez por dia, o serviço baixa em segundo plano as imagens dos produtos ativos que ainda não estão no cache. As consultas são feitas uma de cada vez, com uma pausa entre elas. Depois de 10 falhas seguidas o aquecimento para e tenta de novo em 1h.
 
 > No Render, o disco do serviço é apagado a cada deploy ou restart. Para manter o cache, anexe um disco persistente e aponte `IMAGES_DIR` para ele.
 
@@ -55,6 +56,15 @@ uvicorn main:app --port 8000
 ```
 
 Acesse http://localhost:8000/406676.jpg
+
+## 🧪 Testes
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Os testes usam um Sankhya simulado e não fazem nenhuma chamada real. Eles rodam no GitHub Actions a cada PR e a cada push na `main`.
 
 ## 📄 Licença
 
