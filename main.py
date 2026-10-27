@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import io
 import logging
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Query, Request, Response
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageDraw, UnidentifiedImageError
 from sankhya_api.sk_api_utils import consulta_sankhya
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -83,6 +84,28 @@ def _para_jpeg(conteudo: bytes) -> bytes:
         return conteudo
     with Image.open(io.BytesIO(conteudo)) as img:
         return _salvar_jpeg(img)
+
+
+def _desenhar_sem_imagem() -> bytes:
+    """Imagem padrão para produto sem imagem: uma caixa em tons frios."""
+    tamanho, escala = 800, 2  # desenha em 2x e reduz, para suavizar as bordas
+    img = Image.new("RGB", (tamanho * escala, tamanho * escala), (232, 238, 245))
+    draw = ImageDraw.Draw(img)
+
+    def pontos(*coords):
+        return [(x * escala, y * escala) for x, y in coords]
+
+    draw.ellipse(pontos((250, 578), (550, 622)), fill=(214, 223, 233))  # sombra
+    topo, esq, dir_, frente = (400, 220), (230, 318), (570, 318), (400, 416)
+    base, esq_base, dir_base = (400, 600), (230, 502), (570, 502)
+    draw.polygon(pontos(topo, dir_, frente, esq), fill=(170, 196, 220))  # tampa
+    draw.polygon(pontos(esq, frente, base, esq_base), fill=(111, 147, 181))
+    draw.polygon(pontos(frente, dir_, dir_base, base), fill=(79, 117, 152))
+    draw.polygon(pontos((294, 281), (336, 257), (506, 355), (464, 379)), fill=(196, 216, 234))  # fita
+    return _salvar_jpeg(img.resize((tamanho, tamanho), Image.LANCZOS))
+
+
+SEM_IMAGEM = _desenhar_sem_imagem()
 
 
 def _redimensionar(conteudo: bytes, largura: int) -> bytes:
@@ -298,8 +321,10 @@ def serve_image(
 
     try:
         conteudo = _obter_imagem(codprod)
-    except ImagemNaoEncontrada as e:
-        return Response(content=str(e), status_code=404, headers={"Cache-Control": "public, max-age=300"})
+    except ImagemNaoEncontrada:
+        # Responde 200 com a imagem padrão: o sistema que consome os links precisa de um JPEG
+        conteudo = _sem_imagem_redimensionada(w) if w else SEM_IMAGEM
+        return _responder_jpeg(request, conteudo, {"Cache-Control": "public, max-age=300", "X-Sem-Imagem": "true"})
     except Exception as e:  # pylint: disable=broad-except
         logger.error("Falha ao buscar codprod=%s no Sankhya: %s", codprod, e)
         return Response(content="Erro ao consultar o Sankhya.", status_code=502)
@@ -307,9 +332,17 @@ def serve_image(
     conteudo = _para_jpeg(conteudo)  # cobre arquivos gravados antes da conversão existir
     if w:
         conteudo = _obter_redimensionada(codprod, conteudo, w)
+    return _responder_jpeg(request, conteudo, {"Cache-Control": CACHE_CONTROL})
 
+
+@functools.lru_cache(maxsize=None)
+def _sem_imagem_redimensionada(largura: int) -> bytes:
+    return _redimensionar(SEM_IMAGEM, largura)
+
+
+def _responder_jpeg(request: Request, conteudo: bytes, headers: dict) -> Response:
     etag = f'"{hashlib.md5(conteudo).hexdigest()}"'
-    headers = {"Cache-Control": CACHE_CONTROL, "ETag": etag}
+    headers = {**headers, "ETag": etag}
 
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
