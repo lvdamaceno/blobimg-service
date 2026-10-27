@@ -16,6 +16,7 @@ IMAGES_DIR = Path("images")
 IMAGES_DIR.mkdir(exist_ok=True)  # Garante que a pasta existe
 
 CACHE_CONTROL = "public, max-age=86400"  # 1 dia no navegador/CDN
+# Sempre image/jpeg: o sistema que consome os links só aceita esse tipo
 SEM_IMAGEM_TTL = 3600  # segundos que um "produto sem imagem" fica em cache
 
 _sem_imagem: dict[int, float] = {}  # codprod -> expira em (timestamp)
@@ -30,16 +31,6 @@ class ImagemNaoEncontrada(Exception):
 def _lock_do_produto(codprod: int) -> threading.Lock:
     with _locks_guard:
         return _locks.setdefault(codprod, threading.Lock())
-
-
-def _detectar_media_type(conteudo: bytes) -> str:
-    if conteudo.startswith(b"\x89PNG"):
-        return "image/png"
-    if conteudo.startswith(b"GIF8"):
-        return "image/gif"
-    if conteudo[:4] == b"RIFF" and conteudo[8:12] == b"WEBP":
-        return "image/webp"
-    return "image/jpeg"
 
 
 def consultar_e_salvar_imagem(codprod: int) -> bytes:
@@ -107,4 +98,4 @@ def serve_image(codprod: int, request: Request):
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
 
-    return Response(content=conteudo, media_type=_detectar_media_type(conteudo), headers=headers)
+    return Response(content=conteudo, media_type="image/jpeg", headers=headers)
