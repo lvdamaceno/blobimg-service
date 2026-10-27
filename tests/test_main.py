@@ -135,6 +135,14 @@ def test_falha_do_sankhya_502_sem_cache_negativo(client, sankhya):
     assert client.get("/3").status_code == 200
 
 
+@pytest.mark.parametrize("valor", [b"deletado", b"\x00\x01lixo"])
+def test_campo_imagem_que_nao_e_imagem_vira_404(client, sankhya, valor):
+    sankhya.imagens[4] = valor  # o Sankhya guarda "deletado" quando a imagem é apagada
+    assert client.get("/4.jpg").status_code == 404
+    assert client.get("/4.jpg").status_code == 404
+    assert sankhya.total(4) == 1
+
+
 def test_codprod_invalido(client):
     assert client.get("/abc.jpg").status_code == 422
 
@@ -250,7 +258,10 @@ def test_health_conta_so_originais(client, sankhya):
     sankhya.imagens[2] = _imagem("JPEG")
     client.get("/1")
     client.get("/2?w=100")
-    assert client.get("/health").json() == {"status": "ok", "imagens_em_cache": 2}
+    corpo = client.get("/health").json()
+    assert corpo["status"] == "ok"
+    assert corpo["imagens_em_cache"] == 2
+    assert "estado" in corpo["aquecimento"]
 
 
 def test_aquecimento_baixa_so_o_que_falta(sankhya, tmp_path):
@@ -265,6 +276,16 @@ def test_aquecimento_baixa_so_o_que_falta(sankhya, tmp_path):
     assert len(sankhya.consultas) == 11
 
 
+def test_aquecimento_ignora_imagens_deletadas(sankhya):
+    for codprod in range(1, 21):
+        sankhya.imagens[codprod] = b"deletado" if codprod <= 15 else _imagem("JPEG", tamanho=(10, 10))
+
+    assert main._aquecer_uma_vez() is True  # 15 "deletado" seguidos não interrompem
+    assert main._aquecimento["baixadas"] == 5
+    assert main._aquecimento["falhas"] == 0
+    assert main._aquecimento["estado"] == "concluido"
+
+
 def test_aquecimento_para_apos_falhas_seguidas(sankhya, monkeypatch):
     for codprod in range(1, 31):
         sankhya.imagens[codprod] = _imagem("JPEG", tamanho=(10, 10))
@@ -277,6 +298,8 @@ def test_aquecimento_para_apos_falhas_seguidas(sankhya, monkeypatch):
 
     assert main._aquecer_uma_vez() is False
     assert len(sankhya.consultas) == main.AQUECIMENTO_MAX_FALHAS
+    assert main._aquecimento["estado"] == "interrompido"
+    assert "Sankhya fora" in main._aquecimento["ultimo_erro"]
 
 
 def test_aquecimento_desligado_por_padrao_fora_do_render():
