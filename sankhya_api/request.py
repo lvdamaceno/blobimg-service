@@ -16,12 +16,13 @@ Dependências:
 """
 
 import logging
+import threading
 import time
 from datetime import datetime
 from requests.exceptions import ReadTimeout, ConnectionError as RequestsConnectionError
-import requests
 from .auth import SankhyaAuth
 from .exceptions import RequestError, SankhyaHTTPError
+from .http_session import session, DEFAULT_TIMEOUT
 
 
 def log_tempo(msg=""):
@@ -37,11 +38,12 @@ class SankhyaClient:  # pylint: disable=too-few-public-methods
     gerenciando automaticamente autenticação e tentativas de reconexão em caso de falhas.
     """
 
-    def __init__(self, servicename, endpoint, retries, timeout=30):
+    def __init__(self, servicename, endpoint, retries, timeout=DEFAULT_TIMEOUT):
         # log_tempo("Início da execução do SankhyaClient")
         self.auth = SankhyaAuth()
 
         self._token = None  # token será obtido apenas quando necessário
+        self._token_lock = threading.Lock()
         self.endpoint = endpoint
         self.timeout = timeout
         self.retries = retries
@@ -51,15 +53,16 @@ class SankhyaClient:  # pylint: disable=too-few-public-methods
     def token(self):
         """Token autenticado, obtido sob demanda."""
         if not self._token:
-            # log_tempo("Token ainda não foi obtido. Autenticando...")
-            self._token = self.auth.authenticate()
-            # log_tempo("Token obtido com sucesso")
+            with self._token_lock:
+                if not self._token:
+                    self._token = self.auth.authenticate()
         return self._token
 
-    def _renew_token(self):
-        """Renova e atualiza o token."""
-        # log_tempo("Renovando token de autenticação")
-        self._token = self.auth.authenticate()
+    def _renew_token(self, expired_token):
+        """Renova o token, a menos que outra thread já tenha renovado."""
+        with self._token_lock:
+            if self._token == expired_token:
+                self._token = self.auth.authenticate()
 
     def execute_query(self, sql: str):
         """
@@ -70,35 +73,31 @@ class SankhyaClient:  # pylint: disable=too-few-public-methods
             "requestBody": {"sql": sql}
         }
 
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json"
-        }
-
-        # log_tempo("Antes de enviar para endpoint CS")
-
         for attempt in range(self.retries):
+            token = self.token
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
             try:
-                response = requests.get(
+                response = session.get(
                     self.endpoint,
                     headers=headers,
                     json=payload,
                     timeout=self.timeout
                 )
 
-                # log_tempo(f"Resposta recebida do endpoint (tentativa {attempt + 1})")
-
                 if response.status_code == 200:
                     return response.json()
                 if response.status_code in (401, 403):
-                    # log_tempo("Token expirado ou inválido, tentando renovar")
-                    self._renew_token()
-                    headers["Authorization"] = f"Bearer {self.token}"
+                    # Token expirado ou inválido: renova e tenta de novo
+                    self._renew_token(token)
                     continue
                 raise SankhyaHTTPError(f"Erro HTTP {response.status_code}: {response.text}")
             except (ReadTimeout, RequestsConnectionError) as e:
                 logging.warning("[%d/%d] Timeout ou erro de conexão: %s", attempt + 1, self.retries, e)
-                time.sleep(5)
+                if attempt + 1 < self.retries:
+                    time.sleep(1)
             except Exception as e:
                 raise RequestError(f"Erro de conexão geral: {e}") from e
 
