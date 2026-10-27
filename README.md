@@ -15,7 +15,7 @@ GET /health                 # health check
 
 - A resposta é sempre um JPEG real (`image/jpeg`). Imagens salvas no Sankhya em outro formato (ex.: PNG) são convertidas, e as áreas transparentes ficam com fundo branco.
 - Respostas:
-  - `404`: o produto não tem imagem, ou o campo `IMAGEM` não contém uma imagem (o Sankhya grava o texto `deletado` quando a imagem é apagada).
+  - Produto sem imagem (ou cujo campo `IMAGEM` não contém uma imagem; o Sankhya grava o texto `deletado` quando a imagem é apagada): `200` com uma **imagem padrão** (uma caixa em tons de azul, 800×800, também aceita `?w=`). A resposta vem com o header `X-Sem-Imagem: true` e cache de 5 minutos.
   - `502`: falha ao consultar o Sankhya.
 - Envia `Cache-Control` (1 dia) e `ETag`, e responde `304` quando o cliente já tem a imagem.
 
@@ -24,7 +24,7 @@ GET /health                 # health check
 1. A imagem consultada no Sankhya é gravada em `IMAGES_DIR/{codprod}.jpg`.
 2. Ela é considerada válida por `IMAGEM_TTL` segundos (padrão: 1 dia).
 3. Depois disso, a imagem em disco continua sendo servida e é atualizada em segundo plano. Se o Sankhya falhar, a imagem antiga continua valendo.
-4. Se a imagem foi removida no ERP, o arquivo é apagado e o produto passa a responder `404`.
+4. Se a imagem foi removida no ERP, o arquivo é apagado e o produto passa a responder com a imagem padrão.
 5. Produtos sem imagem ficam 1h em cache de memória, para não consultar o Sankhya a cada acesso.
 6. As versões redimensionadas (`?w=`) também ficam em disco (`{codprod}_w{w}.jpg`) e são refeitas quando a original é atualizada.
 7. Requisições simultâneas do mesmo produto fazem uma única consulta.

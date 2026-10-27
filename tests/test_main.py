@@ -133,10 +133,31 @@ def test_etag_e_304(client, sankhya):
 
 # --- Erros ---------------------------------------------------------------------
 
-def test_sem_imagem_404_com_cache_negativo(client, sankhya):
-    assert client.get("/2").status_code == 404
-    assert client.get("/2").status_code == 404
+def _eh_sem_imagem(r) -> bool:
+    return r.status_code == 200 and r.headers.get("x-sem-imagem") == "true" and r.content == main.SEM_IMAGEM
+
+
+def test_sem_imagem_serve_imagem_padrao_com_cache_negativo(client, sankhya):
+    r = client.get("/2.jpg")
+    assert _eh_sem_imagem(r)
+    assert r.headers["content-type"] == "image/jpeg"
+    assert r.headers["cache-control"] == "public, max-age=300"
+    assert _eh_sem_imagem(client.get("/2"))
     assert sankhya.total(2) == 1
+
+
+def test_imagem_padrao_e_jpeg_redimensionavel_com_etag(client, sankhya, tmp_path):
+    assert main.SEM_IMAGEM.startswith(b"\xff\xd8\xff")
+    r = client.get("/2?w=200")
+    assert r.headers["x-sem-imagem"] == "true"
+    assert _abrir(r.content).width == 200
+    assert client.get("/2?w=200", headers={"If-None-Match": r.headers["etag"]}).status_code == 304
+    assert not list(tmp_path.iterdir())  # nada vai para o disco
+
+
+def test_imagem_real_nao_tem_header_sem_imagem(client, sankhya):
+    sankhya.imagens[1] = _imagem("JPEG")
+    assert "x-sem-imagem" not in client.get("/1").headers
 
 
 def test_falha_do_sankhya_502_sem_cache_negativo(client, sankhya):
@@ -147,10 +168,10 @@ def test_falha_do_sankhya_502_sem_cache_negativo(client, sankhya):
 
 
 @pytest.mark.parametrize("valor", [b"deletado", b"\x00\x01lixo"])
-def test_campo_imagem_que_nao_e_imagem_vira_404(client, sankhya, valor):
+def test_campo_imagem_que_nao_e_imagem_serve_imagem_padrao(client, sankhya, valor):
     sankhya.imagens[4] = valor  # o Sankhya guarda "deletado" quando a imagem é apagada
-    assert client.get("/4.jpg").status_code == 404
-    assert client.get("/4.jpg").status_code == 404
+    assert _eh_sem_imagem(client.get("/4.jpg"))
+    assert _eh_sem_imagem(client.get("/4.jpg"))
     assert sankhya.total(4) == 1
 
 
@@ -213,7 +234,7 @@ def test_vencida_serve_antiga_e_atualiza_em_segundo_plano(client, sankhya, tmp_p
     assert client.get("/1").content == nova
 
 
-def test_vencida_removida_no_erp_passa_a_404(client, sankhya, tmp_path):
+def test_vencida_removida_no_erp_passa_a_imagem_padrao(client, sankhya, tmp_path):
     sankhya.imagens[1] = _imagem("JPEG")
     client.get("/1")
     client.get("/1?w=100")
@@ -222,7 +243,7 @@ def test_vencida_removida_no_erp_passa_a_404(client, sankhya, tmp_path):
 
     assert client.get("/1").status_code == 200
     assert _esperar(lambda: not (tmp_path / "1.jpg").exists() and not (tmp_path / "1_w100.jpg").exists())
-    assert client.get("/1").status_code == 404
+    assert _eh_sem_imagem(client.get("/1"))
 
 
 def test_vencida_com_sankhya_fora_mantem_antiga(client, sankhya, tmp_path):
