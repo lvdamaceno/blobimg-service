@@ -32,16 +32,6 @@ def _lock_do_produto(codprod: int) -> threading.Lock:
         return _locks.setdefault(codprod, threading.Lock())
 
 
-def _detectar_media_type(conteudo: bytes) -> str:
-    if conteudo.startswith(b"\x89PNG"):
-        return "image/png"
-    if conteudo.startswith(b"GIF8"):
-        return "image/gif"
-    if conteudo[:4] == b"RIFF" and conteudo[8:12] == b"WEBP":
-        return "image/webp"
-    return "image/jpeg"
-
-
 def consultar_e_salvar_imagem(codprod: int) -> bytes:
     sankhya_service = "DbExplorerSP.executeQuery"
     query = f"SELECT IMAGEM FROM TGFPRO WHERE CODPROD = {codprod}"
@@ -107,4 +97,5 @@ def serve_image(codprod: int, request: Request):
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
 
-    return Response(content=conteudo, media_type=_detectar_media_type(conteudo), headers=headers)
+    # Sempre image/jpeg: o sistema que consome os links só aceita esse tipo
+    return Response(content=conteudo, media_type="image/jpeg", headers=headers)
