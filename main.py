@@ -146,7 +146,8 @@ def _obter_imagem(codprod: int) -> bytes:
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    # imagens_em_cache permite conferir se o disco persiste entre deploys
+    return {"status": "ok", "imagens_em_cache": sum(1 for _ in IMAGES_DIR.glob("*.jpg"))}
 
 
 @app.get("/{codprod}")
