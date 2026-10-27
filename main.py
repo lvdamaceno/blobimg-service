@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -14,7 +15,15 @@ from sankhya_api.sk_api_utils import consulta_sankhya
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("blobimg")
 
-app = FastAPI()
+
+@asynccontextmanager
+async def _lifespan(_app):
+    if AQUECER_CACHE:
+        threading.Thread(target=_aquecer_cache, daemon=True).start()
+    yield
+
+
+app = FastAPI(lifespan=_lifespan)
 IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))  # aponte para o disco persistente, se houver
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)  # Garante que a pasta existe
 
@@ -23,6 +32,13 @@ SEM_IMAGEM_TTL = 3600  # segundos que um "produto sem imagem" fica em cache
 CACHE_CONTROL = "public, max-age=86400"  # 1 dia no navegador/CDN
 JPEG_QUALIDADE = 90
 LARGURA_MIN, LARGURA_MAX = 16, 2000
+
+# Aquecimento: baixa em segundo plano as imagens que ainda não estão no cache.
+# Ligado por padrão só no Render (que define RENDER=true), para não baixar tudo em dev.
+AQUECER_CACHE = os.getenv("AQUECER_CACHE", os.getenv("RENDER", "false")).lower() in ("1", "true")
+AQUECIMENTO_INTERVALO = 86400  # repete diariamente, para pegar produtos novos
+AQUECIMENTO_PAUSA = 0.2  # segundos entre consultas, para não sobrecarregar o Sankhya
+AQUECIMENTO_MAX_FALHAS = 10  # falhas seguidas antes de desistir e tentar mais tarde
 
 _sem_imagem: dict[int, float] = {}  # codprod -> expira em (timestamp)
 _locks: dict[int, threading.Lock] = {}
@@ -142,6 +158,65 @@ def _obter_imagem(codprod: int) -> bytes:
         except ImagemNaoEncontrada:
             _sem_imagem[codprod] = time.time() + SEM_IMAGEM_TTL
             raise
+
+
+def _listar_produtos_com_imagem() -> list:
+    """Códigos dos produtos ativos com imagem, paginando (o DbExplorer limita a 5000 linhas)."""
+    codigos, ultimo = [], 0
+    while True:
+        lote = consulta_sankhya(
+            "SELECT CODPROD FROM TGFPRO WHERE IMAGEM IS NOT NULL AND ATIVO = 'S' "
+            f"AND CODPROD > {ultimo} ORDER BY CODPROD",
+            "DbExplorerSP.executeQuery",
+        )
+        if not lote:
+            return codigos
+        codigos += lote
+        ultimo = int(lote[-1])
+
+
+def _aquecer_uma_vez() -> bool:
+    """Baixa as imagens que faltam no cache. Retorna False se parou por falhas seguidas."""
+    faltando = [c for c in _listar_produtos_com_imagem() if not _caminho(int(c)).exists()]
+    logger.info("Aquecimento: %d imagens fora do cache", len(faltando))
+
+    baixadas = falhas_seguidas = 0
+    for codprod in map(int, faltando):
+        lock = _lock_do_produto(codprod)
+        if not lock.acquire(blocking=False):
+            continue  # uma requisição já está buscando este produto
+        try:
+            if not _caminho(codprod).exists():
+                consultar_e_salvar_imagem(codprod)
+                baixadas += 1
+            falhas_seguidas = 0
+        except ImagemNaoEncontrada:
+            falhas_seguidas = 0
+        except Exception as e:  # pylint: disable=broad-except
+            falhas_seguidas += 1
+            logger.warning("Aquecimento: falha em codprod=%s: %s", codprod, e)
+            if falhas_seguidas >= AQUECIMENTO_MAX_FALHAS:
+                logger.error("Aquecimento interrompido após %d falhas seguidas", falhas_seguidas)
+                return False
+        finally:
+            lock.release()
+        if baixadas and baixadas % 500 == 0:
+            logger.info("Aquecimento: %d/%d imagens baixadas", baixadas, len(faltando))
+        time.sleep(AQUECIMENTO_PAUSA)
+
+    logger.info("Aquecimento concluído: %d imagens baixadas", baixadas)
+    return True
+
+
+def _aquecer_cache():
+    while True:
+        try:
+            concluido = _aquecer_uma_vez()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error("Falha no aquecimento do cache: %s", e)
+            concluido = False
+        # Se o Sankhya estava com problema, tenta de novo em 1h em vez de esperar 1 dia
+        time.sleep(AQUECIMENTO_INTERVALO if concluido else 3600)
 
 
 @app.get("/health")
