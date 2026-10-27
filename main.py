@@ -40,6 +40,10 @@ AQUECIMENTO_INTERVALO = 86400  # repete diariamente, para pegar produtos novos
 AQUECIMENTO_PAUSA = 0.2  # segundos entre consultas, para não sobrecarregar o Sankhya
 AQUECIMENTO_MAX_FALHAS = 10  # falhas seguidas antes de desistir e tentar mais tarde
 
+# O gateway do Sankhya devolve erro 500 para imagens grandes; acima disso, busca em partes
+LIMITE_CONSULTA_INTEIRA = 2_000_000  # bytes
+TAMANHO_PARTE = 2_000_000  # bytes por consulta ao buscar em partes
+
 _sem_imagem: dict[int, float] = {}  # codprod -> expira em (timestamp)
 _locks: dict[int, threading.Lock] = {}
 _locks_guard = threading.Lock()
@@ -116,22 +120,40 @@ def _remover_do_cache(codprod: int):
     _caminho(codprod).unlink(missing_ok=True)
 
 
-def consultar_e_salvar_imagem(codprod: int) -> bytes:
-    sankhya_service = "DbExplorerSP.executeQuery"
-    query = f"SELECT IMAGEM FROM TGFPRO WHERE CODPROD = {codprod}"
+def _consultar(sql: str):
+    return consulta_sankhya(sql, "DbExplorerSP.executeQuery")
 
+
+def _buscar_imagem_hex(codprod: int) -> Optional[str]:
+    """Conteúdo do campo IMAGEM em hex; imagens grandes são buscadas em partes."""
+    try:
+        result = _consultar(f"SELECT IMAGEM FROM TGFPRO WHERE CODPROD = {codprod}")
+        return result[0] if result else None
+    except Exception:
+        tamanho = _consultar(f"SELECT DATALENGTH(IMAGEM) FROM TGFPRO WHERE CODPROD = {codprod}")
+        tamanho = int(tamanho[0] or 0) if tamanho else 0
+        if tamanho <= LIMITE_CONSULTA_INTEIRA:
+            raise  # não é problema de tamanho
+        logger.info("codprod=%s: imagem de %.1fMB, buscando em partes", codprod, tamanho / 1e6)
+        return "".join(
+            _consultar(f"SELECT SUBSTRING(IMAGEM, {inicio}, {TAMANHO_PARTE}) FROM TGFPRO WHERE CODPROD = {codprod}")[0]
+            for inicio in range(1, tamanho + 1, TAMANHO_PARTE)
+        )
+
+
+def consultar_e_salvar_imagem(codprod: int) -> bytes:
     inicio = time.monotonic()
-    result = consulta_sankhya(query, sankhya_service)
+    imagem_hex = _buscar_imagem_hex(codprod)
     logger.info("Consulta Sankhya codprod=%s em %.2fs", codprod, time.monotonic() - inicio)
 
-    if not result or not result[0]:
+    if not imagem_hex:
         raise ImagemNaoEncontrada("Imagem não encontrada no banco de dados.")
 
     try:
-        imagem_bytes = _para_jpeg(bytes.fromhex(result[0]))
+        imagem_bytes = _para_jpeg(bytes.fromhex(imagem_hex))
     except (ValueError, UnidentifiedImageError) as e:
         # O Sankhya às vezes guarda texto no lugar da imagem (ex.: "deletado")
-        logger.warning("codprod=%s: conteúdo do campo IMAGEM não é uma imagem (%d bytes)", codprod, len(result[0]) // 2)
+        logger.warning("codprod=%s: conteúdo do campo IMAGEM não é uma imagem (%d bytes)", codprod, len(imagem_hex) // 2)
         raise ImagemNaoEncontrada("Imagem não encontrada no banco de dados.") from e
     _gravar(_caminho(codprod), imagem_bytes)
     return imagem_bytes
@@ -191,10 +213,10 @@ def _listar_produtos_com_imagem() -> list:
     """Códigos dos produtos ativos com imagem, paginando (o DbExplorer limita a 5000 linhas)."""
     codigos, ultimo = [], 0
     while True:
-        lote = consulta_sankhya(
-            "SELECT CODPROD FROM TGFPRO WHERE IMAGEM IS NOT NULL AND ATIVO = 'S' "
-            f"AND CODPROD > {ultimo} ORDER BY CODPROD",
-            "DbExplorerSP.executeQuery",
+        lote = _consultar(
+            # DATALENGTH > 100 descarta campos vazios ou com texto ("deletado")
+            "SELECT CODPROD FROM TGFPRO WHERE DATALENGTH(IMAGEM) > 100 AND ATIVO = 'S' "
+            f"AND CODPROD > {ultimo} ORDER BY CODPROD"
         )
         if not lote:
             return codigos

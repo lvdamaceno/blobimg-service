@@ -31,21 +31,32 @@ class SankhyaFalso:
         self.imagens = {}
         self.consultas = []
         self.atraso = 0
+        self.limite_gateway = float("inf")
+        self.partes = 0
         self._lock = threading.Lock()
 
     def __call__(self, query, service):
         if "SELECT CODPROD" in query:
             ultimo = int(re.search(r"CODPROD > (\d+)", query).group(1))
-            com_imagem = sorted(c for c, v in self.imagens.items() if isinstance(v, bytes))
+            com_imagem = sorted(c for c, v in self.imagens.items() if isinstance(v, bytes) and len(v) > 100)
             return [c for c in com_imagem if c > ultimo][:5]  # simula o limite de linhas do DbExplorer
 
         codprod = int(query.rsplit("=", 1)[1])
+        valor = self.imagens.get(codprod)
+        if query.startswith("SELECT DATALENGTH"):
+            return [str(len(valor)) if isinstance(valor, bytes) else None]
+        if query.startswith("SELECT SUBSTRING"):
+            inicio, tamanho = map(int, re.search(r"SUBSTRING\(IMAGEM, (\d+), (\d+)\)", query).groups())
+            self.partes += 1
+            return [valor[inicio - 1:inicio - 1 + tamanho].hex()]
+
         with self._lock:
             self.consultas.append(codprod)
         time.sleep(self.atraso)
-        valor = self.imagens.get(codprod)
         if isinstance(valor, Exception):
             raise valor
+        if valor and len(valor) > self.limite_gateway:
+            raise RuntimeError("Erro HTTP 500")  # o gateway não devolve imagens grandes inteiras
         return [valor.hex()] if valor else [None]
 
     def total(self, codprod):
@@ -141,6 +152,29 @@ def test_campo_imagem_que_nao_e_imagem_vira_404(client, sankhya, valor):
     assert client.get("/4.jpg").status_code == 404
     assert client.get("/4.jpg").status_code == 404
     assert sankhya.total(4) == 1
+
+
+def test_imagem_grande_buscada_em_partes(client, sankhya, monkeypatch):
+    monkeypatch.setattr(main, "LIMITE_CONSULTA_INTEIRA", 300)
+    monkeypatch.setattr(main, "TAMANHO_PARTE", 200)
+    grande = _imagem("PNG", tamanho=(300, 300), modo="RGB")
+    assert len(grande) > 300
+    sankhya.imagens[5] = grande
+    sankhya.limite_gateway = 300
+
+    r = client.get("/5.jpg")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/jpeg"
+    assert _abrir(r.content).size == (300, 300)
+    assert sankhya.partes == -(-len(grande) // 200)  # arredonda para cima
+
+
+def test_erro_em_imagem_pequena_nao_tenta_partes(client, sankhya, monkeypatch):
+    monkeypatch.setattr(main, "LIMITE_CONSULTA_INTEIRA", 10_000_000)
+    sankhya.imagens[5] = _imagem("JPEG")
+    sankhya.limite_gateway = 10  # força o erro
+    assert client.get("/5.jpg").status_code == 502
+    assert sankhya.partes == 0
 
 
 def test_codprod_invalido(client):
