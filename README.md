@@ -1,60 +1,53 @@
-# Servidor de Imagens de Produtos via FastAPI
+# Servidor de Imagens de Produtos (Sankhya)
 
-Este projeto expõe imagens de produtos salvas no banco de dados Sankhya via URL HTTP.
+Expõe a imagem de cada produto cadastrada no Sankhya (`TGFPRO.IMAGEM`) como um link HTTP.
 
-## 📦 Requisitos
+Produção: https://blobimg-service.onrender.com (Render, deploy automático a partir da `main`).
 
-- Python 3.9+
-- FastAPI
-- Uvicorn
-- sankhya_api (módulo personalizado de acesso à API Sankhya)
+## 🌐 Como usar
 
-## ⚙️ Instalação
-
-```bash
-pip install fastapi uvicorn
+```
+GET /{codprod}.jpg          # ex.: /406676.jpg
+GET /{codprod}              # mesmo resultado
+GET /{codprod}.jpg?w=400    # redimensionada para no máximo 400px de largura (16–2000)
+GET /health                 # health check
 ```
 
-Adicione o módulo `sankhya_api` ao seu projeto (estrutura esperada: `from sankhya_api.sk_api_utils import consulta_sankhya`).
+- A resposta é sempre um JPEG real (`image/jpeg`). Imagens salvas no Sankhya em outro formato (ex.: PNG) são convertidas, e as áreas transparentes ficam com fundo branco.
+- Respostas:
+  - `404`: o produto não tem imagem.
+  - `502`: falha ao consultar o Sankhya.
+- Envia `Cache-Control` (1 dia) e `ETag`, e responde `304` quando o cliente já tem a imagem.
+
+## ⚡ Cache
+
+1. A imagem consultada no Sankhya é gravada em `IMAGES_DIR/{codprod}.jpg`.
+2. Ela é considerada válida por `IMAGEM_TTL` segundos (padrão: 1 dia).
+3. Depois disso, a imagem em disco continua sendo servida e é atualizada em segundo plano. Se o Sankhya falhar, a imagem antiga continua valendo.
+4. Se a imagem foi removida no ERP, o arquivo é apagado e o produto passa a responder `404`.
+5. Produtos sem imagem ficam 1h em cache de memória, para não consultar o Sankhya a cada acesso.
+6. Requisições simultâneas do mesmo produto fazem uma única consulta.
+
+> No Render, o disco do serviço é apagado a cada deploy ou restart. Para manter o cache, anexe um disco persistente e aponte `IMAGES_DIR` para ele.
+
+## ⚙️ Configuração
+
+Variáveis de ambiente (veja `sankhya_api/.env.example`):
+
+| Variável | Descrição |
+|---|---|
+| `SANKHYA_TOKEN`, `SANKHYA_APPKEY`, `SANKHYA_USERNAME`, `SANKHYA_PASSWORD` | Credenciais da API Sankhya |
+| `IMAGES_DIR` | Pasta do cache em disco (padrão: `images`) |
+| `IMAGEM_TTL` | Validade da imagem em disco, em segundos (padrão: `86400`) |
 
 ## 🚀 Executando localmente
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+pip install -r requirements.txt
+uvicorn main:app --port 8000
 ```
 
-## 🌐 Como usar
-
-Acesse via navegador ou ferramenta HTTP:
-
-```
-http://localhost:8000/406676.jpg
-```
-
-Esse endpoint irá:
-
-1. Buscar a imagem no banco de dados Sankhya.
-2. Gerar o arquivo temporário na pasta `images/`.
-3. Servir a imagem como `image/jpeg`.
-4. Apagar o arquivo automaticamente após envio.
-
-## 🧹 Limpeza automática
-
-O arquivo de imagem é removido logo após ser enviado para evitar acúmulo no servidor.
-
-## 📁 Estrutura esperada
-
-```
-.
-├── main.py
-├── images/          # Pasta criada automaticamente
-└── sankhya_api/
-    └── sk_api_utils.py  # Deve conter a função consulta_sankhya()
-```
-
-## 🛠️ Personalização
-
-Se desejar manter as imagens no servidor, basta remover o uso de `BackgroundTasks`.
+Acesse http://localhost:8000/406676.jpg
 
 ## 📄 Licença
 

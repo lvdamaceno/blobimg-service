@@ -1,22 +1,28 @@
 import hashlib
+import io
 import logging
 import os
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Query, Request, Response
+from PIL import Image
 from sankhya_api.sk_api_utils import consulta_sankhya
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("blobimg")
 
 app = FastAPI()
-IMAGES_DIR = Path("images")
-IMAGES_DIR.mkdir(exist_ok=True)  # Garante que a pasta existe
+IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))  # aponte para o disco persistente, se houver
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)  # Garante que a pasta existe
 
-CACHE_CONTROL = "public, max-age=86400"  # 1 dia no navegador/CDN
+IMAGEM_TTL = int(os.getenv("IMAGEM_TTL", "86400"))  # validade da imagem em disco (segundos)
 SEM_IMAGEM_TTL = 3600  # segundos que um "produto sem imagem" fica em cache
+CACHE_CONTROL = "public, max-age=86400"  # 1 dia no navegador/CDN
+JPEG_QUALIDADE = 90
+LARGURA_MIN, LARGURA_MAX = 16, 2000
 
 _sem_imagem: dict[int, float] = {}  # codprod -> expira em (timestamp)
 _locks: dict[int, threading.Lock] = {}
@@ -32,6 +38,40 @@ def _lock_do_produto(codprod: int) -> threading.Lock:
         return _locks.setdefault(codprod, threading.Lock())
 
 
+def _caminho(codprod: int) -> Path:
+    return IMAGES_DIR / f"{codprod}.jpg"
+
+
+def _salvar_jpeg(img: Image.Image) -> bytes:
+    # JPEG não tem transparência: compõe sobre fundo branco
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        fundo = Image.new("RGB", img.size, (255, 255, 255))
+        fundo.paste(img, mask=img.getchannel("A"))
+        img = fundo
+    elif img.mode not in ("RGB", "L", "CMYK"):
+        img = img.convert("RGB")
+    saida = io.BytesIO()
+    img.save(saida, format="JPEG", quality=JPEG_QUALIDADE, optimize=True)
+    return saida.getvalue()
+
+
+def _para_jpeg(conteudo: bytes) -> bytes:
+    """Converte para JPEG de verdade; o sistema que consome os links só aceita JPEG."""
+    if conteudo.startswith(b"\xff\xd8\xff"):
+        return conteudo
+    with Image.open(io.BytesIO(conteudo)) as img:
+        return _salvar_jpeg(img)
+
+
+def _redimensionar(conteudo: bytes, largura: int) -> bytes:
+    with Image.open(io.BytesIO(conteudo)) as img:
+        if largura >= img.width:
+            return conteudo  # nunca amplia
+        altura = max(1, round(img.height * largura / img.width))
+        return _salvar_jpeg(img.resize((largura, altura), Image.LANCZOS))
+
+
 def consultar_e_salvar_imagem(codprod: int) -> bytes:
     sankhya_service = "DbExplorerSP.executeQuery"
     query = f"SELECT IMAGEM FROM TGFPRO WHERE CODPROD = {codprod}"
@@ -43,8 +83,8 @@ def consultar_e_salvar_imagem(codprod: int) -> bytes:
     if not result or not result[0]:
         raise ImagemNaoEncontrada("Imagem não encontrada no banco de dados.")
 
-    imagem_bytes = bytes.fromhex(result[0])
-    image_path = IMAGES_DIR / f"{codprod}.jpg"
+    imagem_bytes = _para_jpeg(bytes.fromhex(result[0]))
+    image_path = _caminho(codprod)
 
     # Grava em arquivo temporário e renomeia: nunca deixa arquivo pela metade no cache
     tmp_path = image_path.with_suffix(f".{threading.get_ident()}.tmp")
@@ -54,18 +94,49 @@ def consultar_e_salvar_imagem(codprod: int) -> bytes:
     return imagem_bytes
 
 
+def _ler_cache(codprod: int):
+    """Retorna (conteúdo, idade em segundos) ou (None, 0) se não houver arquivo."""
+    image_path = _caminho(codprod)
+    try:
+        idade = time.time() - image_path.stat().st_mtime
+        return image_path.read_bytes(), idade
+    except FileNotFoundError:
+        return None, 0
+
+
+def _atualizar_em_segundo_plano(codprod: int):
+    lock = _lock_do_produto(codprod)
+    if not lock.acquire(blocking=False):
+        return  # já há uma consulta deste produto em andamento
+    try:
+        consultar_e_salvar_imagem(codprod)
+    except ImagemNaoEncontrada:
+        # A imagem foi removida no ERP
+        _sem_imagem[codprod] = time.time() + SEM_IMAGEM_TTL
+        _caminho(codprod).unlink(missing_ok=True)
+    except Exception as e:  # pylint: disable=broad-except
+        # Mantém a imagem antiga; tenta de novo na próxima requisição
+        logger.warning("Falha ao atualizar codprod=%s: %s", codprod, e)
+    finally:
+        lock.release()
+
+
 def _obter_imagem(codprod: int) -> bytes:
-    image_path = IMAGES_DIR / f"{codprod}.jpg"
-    if image_path.exists():
-        return image_path.read_bytes()
+    conteudo, idade = _ler_cache(codprod)
+    if conteudo is not None:
+        if idade > IMAGEM_TTL and not _lock_do_produto(codprod).locked():
+            # Vencida: responde com a imagem atual e atualiza sem fazer o cliente esperar
+            threading.Thread(target=_atualizar_em_segundo_plano, args=(codprod,), daemon=True).start()
+        return conteudo
 
     if _sem_imagem.get(codprod, 0) > time.time():
         raise ImagemNaoEncontrada("Imagem não encontrada no banco de dados.")
 
     # Requisições simultâneas do mesmo produto fazem uma única consulta ao Sankhya
     with _lock_do_produto(codprod):
-        if image_path.exists():
-            return image_path.read_bytes()
+        conteudo, _ = _ler_cache(codprod)
+        if conteudo is not None:
+            return conteudo
         try:
             return consultar_e_salvar_imagem(codprod)
         except ImagemNaoEncontrada:
@@ -80,7 +151,11 @@ def health():
 
 @app.get("/{codprod}")
 @app.get("/{codprod}.jpg")
-def serve_image(codprod: int, request: Request):
+def serve_image(
+    codprod: int,
+    request: Request,
+    w: Optional[int] = Query(None, ge=LARGURA_MIN, le=LARGURA_MAX, description="Largura máxima em pixels"),
+):
     # Função síncrona: o FastAPI executa em threadpool, então uma consulta lenta
     # ao Sankhya não bloqueia as demais requisições.
     try:
@@ -91,11 +166,14 @@ def serve_image(codprod: int, request: Request):
         logger.error("Falha ao buscar codprod=%s no Sankhya: %s", codprod, e)
         return Response(content="Erro ao consultar o Sankhya.", status_code=502)
 
+    conteudo = _para_jpeg(conteudo)  # cobre arquivos gravados antes da conversão existir
+    if w:
+        conteudo = _redimensionar(conteudo, w)
+
     etag = f'"{hashlib.md5(conteudo).hexdigest()}"'
     headers = {"Cache-Control": CACHE_CONTROL, "ETag": etag}
 
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
 
-    # Sempre image/jpeg: o sistema que consome os links só aceita esse tipo
     return Response(content=conteudo, media_type="image/jpeg", headers=headers)
