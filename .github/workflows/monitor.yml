@@ -1,0 +1,31 @@
+name: Monitoramento
+
+# Confere a cada 5 minutos se o serviço está no ar e servindo JPEG.
+# Se falhar, o GitHub envia e-mail para quem alterou este agendamento por último.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BASE_URL: https://blobimg-service.onrender.com
+    steps:
+      - name: Health check
+        # Até 4 tentativas com 30s de intervalo: um deploy deixa o serviço ~1min30 fora do ar
+        run: |
+          for i in 1 2 3 4; do
+            if curl -sf -m 20 "$BASE_URL/health"; then echo; exit 0; fi
+            echo "Tentativa $i falhou"; sleep 30
+          done
+          echo "::error::/health não respondeu"; exit 1
+
+      - name: Imagem servida como JPEG
+        run: |
+          tipo=$(curl -s -o /tmp/img -m 60 -w "%{http_code} %{content_type}" "$BASE_URL/406676.jpg")
+          echo "$tipo"
+          [ "$tipo" = "200 image/jpeg" ] || { echo "::error::Resposta inesperada: $tipo"; exit 1; }
+          [ "$(head -c3 /tmp/img | xxd -p)" = "ffd8ff" ] || { echo "::error::Conteúdo não é JPEG"; exit 1; }
